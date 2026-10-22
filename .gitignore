@@ -1,0 +1,15 @@
+# Disco de la VM de Windows (64 GB disperso, ~15 GB reales). Se descarga o se copia aparte: ver README.
+/windows/
+*.iso
+*.img
+windows-disco*.tar*
+
+# Compilación .NET
+bin/
+obj/
+
+# Resultados de pruebas de carga
+/resultados/
+
+# Variables locales
+.env

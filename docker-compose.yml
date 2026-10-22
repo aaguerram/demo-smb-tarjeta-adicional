@@ -1,0 +1,95 @@
+name: demo-smb-tarjeta-adicional
+
+# Demo: generar el PDF de la solicitud de tarjeta adicional y guardarlo en una carpeta compartida
+# de Windows por SMB 3.
+#
+#   cliente -> sd-generar-solicitud-tarjeta-pdf -> balanceador-proxy -> proxy-guardar-pdf -> windows
+#
+#   windows   Windows 11 ARM64 en una VM KVM (dockurr/windows-arm). El disco vive en ./windows
+#             (fuera de git). oem/ crea la cuenta y la carpeta compartida \\windows\TarjetaAdicional.
+#   proxy     Único servicio que habla SMB, con un pool acotado de conexiones (SMBLibrary).
+#   sd        Genera el PDF y lo envía al proxy con PUT binario (application/pdf).
+#   balanceo  nginx round-robin delante de las réplicas del proxy, como el Service de OpenShift.
+
+services:
+  windows:
+    # Versión fija de la imagen usada en las pruebas (digest sha256:b4fc5248...b1e727).
+    # En un host x86_64 cambiar por dockurr/windows:6.06.
+    image: dockurr/windows-arm:6.06
+    environment:
+      VERSION: "11"          # Windows 11 ARM64, descargado de los servidores de Microsoft
+      RAM_SIZE: "6G"
+      CPU_CORES: "4"
+      DISK_SIZE: "64G"
+      # Sin el Samba propio de la imagen: si no, el contenedor atiende el 445 en lugar de
+      # reenviarlo a Windows y nadie llega a la carpeta compartida.
+      SAMBA: "N"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "127.0.0.1:8006:8006"   # Consola web de Windows
+    volumes:
+      - ./windows:/storage
+      - ./oem:/oem:ro
+    stop_grace_period: 2m
+
+  proxy-guardar-pdf:
+    build:
+      context: ./servicios/proxy-guardar-pdf
+    # UID arbitrario y grupo 0, igual que asigna OpenShift con la SCC restricted-v2.
+    user: "1000870000:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      SMB_SERVIDOR: windows
+      SMB_RECURSO: TarjetaAdicional
+      SMB_DOMINIO: ${SMB_DOMINIO:-DEMO}
+      SMB_USUARIO: ${SMB_USUARIO:-svc-pdf-demo}
+      SMB_CLAVE: ${SMB_CLAVE:-Prueba.Smb.2026}
+      SMB_MAX_CONEXIONES: ${SMB_MAX_CONEXIONES:-8}
+      SMB_INACTIVIDAD_SEGUNDOS: ${SMB_INACTIVIDAD_SEGUNDOS:-30}
+      SMB_VIDA_MAXIMA_MINUTOS: ${SMB_VIDA_MAXIMA_MINUTOS:-10}
+    # Rango de puertos para poder escalar réplicas: --scale proxy-guardar-pdf=4
+    ports:
+      - "127.0.0.1:8082-8085:8080"
+    depends_on:
+      - windows
+
+  balanceador-proxy:
+    image: nginx:1.28.0-alpine
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+    volumes:
+      - ./balanceador/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:8086:8080"
+    depends_on:
+      - proxy-guardar-pdf
+
+  sd-generar-solicitud-tarjeta-pdf:
+    build:
+      context: ./servicios/sd-generar-solicitud-tarjeta-pdf
+    user: "1000870000:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      PROXY_GUARDAR_PDF_URL: http://balanceador-proxy:8080/
+    ports:
+      - "127.0.0.1:8081:8080"
+    depends_on:
+      - balanceador-proxy
