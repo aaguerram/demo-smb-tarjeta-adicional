@@ -8,13 +8,31 @@ const long TamanoMaximo = 20 * 1024 * 1024;
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.ConfigureKestrel(k => k.Limits.MaxRequestBodySize = TamanoMaximo);
 builder.Services.AddProblemDetails();
+// Las variables obligatorias se validan al arrancar. Si falta alguna, el proceso termina con
+// código 1 y un mensaje claro. Se usa Environment.Exit y no una excepción: en un contenedor el
+// proceso es PID 1 y el abort() de una excepción no controlada lo deja colgado en lugar de terminar.
+var configuracion = builder.Configuration;
+var errores = new[] { "SMB_SERVIDOR", "SMB_RECURSO", "SMB_USUARIO", "SMB_CLAVE" }
+    .Where(nombre => string.IsNullOrEmpty(configuracion[nombre]))
+    .Select(nombre => $"Falta la variable de entorno {nombre}")
+    .ToList();
+var maxConexiones = configuracion.GetValue("SMB_MAX_CONEXIONES", 8);
+if (maxConexiones < 1)
+    errores.Add("SMB_MAX_CONEXIONES debe ser 1 o más");
+if (errores.Count > 0)
+{
+    foreach (var error in errores) Console.Error.WriteLine(error);
+    Environment.Exit(1);
+}
+string Requerida(string nombre) => configuracion[nombre]!;
+
 builder.Services.AddSingleton(new OpcionesSmb(
-    Servidor: builder.Configuration["SMB_SERVIDOR"]!,
-    Recurso: builder.Configuration["SMB_RECURSO"]!,
-    Dominio: builder.Configuration["SMB_DOMINIO"]!,
-    Usuario: builder.Configuration["SMB_USUARIO"]!,
-    Clave: builder.Configuration["SMB_CLAVE"]!,
-    MaxConexiones: builder.Configuration.GetValue("SMB_MAX_CONEXIONES", 8),
+    Servidor: Requerida("SMB_SERVIDOR"),
+    Recurso: Requerida("SMB_RECURSO"),
+    Dominio: configuracion["SMB_DOMINIO"] ?? "",
+    Usuario: Requerida("SMB_USUARIO"),
+    Clave: Requerida("SMB_CLAVE"),
+    MaxConexiones: maxConexiones,
     Inactividad: TimeSpan.FromSeconds(builder.Configuration.GetValue("SMB_INACTIVIDAD_SEGUNDOS", 30)),
     VidaMaxima: TimeSpan.FromMinutes(builder.Configuration.GetValue("SMB_VIDA_MAXIMA_MINUTOS", 10))));
 // Registrados por tipo: el contenedor de DI llama Dispose al apagar y el pool cierra sus conexiones.

@@ -23,7 +23,7 @@ cliente ─POST JSON─▶ sd-generar-solicitud-tarjeta-pdf ─PUT application/p
 ├── docker-compose.yml
 ├── servicios/
 │   ├── sd-generar-solicitud-tarjeta-pdf/   # genera el PDF y llama al proxy
-│   └── proxy-guardar-pdf/                  # API de PDF + PoolConexionesSmb + CarpetaPdf
+│   └── proxy-guardar-pdf/                  # API de PDF + PoolConexionesSmb + CarpetaPdf (README propio)
 ├── balanceador/nginx.conf                  # round-robin entre réplicas del proxy
 ├── oem/                                    # scripts que configuran Windows al terminar la instalación
 │   ├── install.bat
@@ -179,9 +179,12 @@ Errores en `application/problem+json` (RFC 9457). `{id}`: de 1 a 64 letras, núm
 
 ## Configuración
 
+La descripción completa del proxy y todas sus variables de entorno están en
+[servicios/proxy-guardar-pdf/README.md](servicios/proxy-guardar-pdf/README.md).
+
 | Variable | Por defecto | Servicio |
 |---|---|---|
-| `SMB_DOMINIO` | `DEMO` | proxy. Una cuenta local de Windows acepta cualquier dominio |
+| `SMB_DOMINIO` | `DEMO` | proxy. Opcional: vacío para una cuenta local, que también acepta cualquier dominio |
 | `SMB_USUARIO` / `SMB_CLAVE` | `svc-pdf-demo` / `Prueba.Smb.2026` | proxy. Deben coincidir con `oem/configurar-smb.ps1` |
 | `SMB_MAX_CONEXIONES` | 8 | proxy |
 | `SMB_INACTIVIDAD_SEGUNDOS` | 30 | proxy |
