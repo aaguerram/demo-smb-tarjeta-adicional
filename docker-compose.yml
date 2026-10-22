@@ -49,7 +49,7 @@ services:
     tmpfs:
       - /tmp
     environment:
-      SMB_SERVIDOR: windows
+      SMB_SERVIDOR: ${SMB_SERVIDOR:-windows}
       SMB_RECURSO: TarjetaAdicional
       SMB_DOMINIO: ${SMB_DOMINIO:-DEMO}
       SMB_USUARIO: ${SMB_USUARIO:-svc-pdf-demo}

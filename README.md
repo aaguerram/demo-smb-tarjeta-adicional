@@ -13,7 +13,7 @@ cliente ─POST JSON─▶ sd-generar-solicitud-tarjeta-pdf ─PUT application/p
 |---|---|---|
 | `sd-generar-solicitud-tarjeta-pdf` | .NET 10, imagen Red Hat UBI 9 | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf`: genera el PDF y lo envía al proxy con `PUT` binario, `Content-Length` y `Content-Digest` (SHA-256). Una conexión por petición, timeout configurable y reintentos con `AddStandardResilienceHandler` |
 | `balanceador-proxy` | nginx 1.28 | Reparte cada petición en round-robin entre las réplicas del proxy, sin guardar el PDF en búfer |
-| `proxy-guardar-pdf` | .NET 10, SMBLibrary 1.5.8.1, UBI 9 | `PUT` y `GET /v1/pdfs/{id}`. Copia el cuerpo por bloques de 64 KB a un temporal y lo renombra si el SHA-256 coincide. Pool acotado de conexiones SMB |
+| `proxy-guardar-pdf` | .NET 10, SMBLibrary 1.5.8.1, UBI 9 | `PUT` y `GET /v1/pdfs/{id}`. Copia el cuerpo por bloques de 64 KB a un temporal y lo renombra si el SHA-256 coincide. Pool acotado de conexiones SMB, timeouts y circuit breaker hacia Windows |
 | `windows` | `dockurr/windows-arm:6.06` | Windows 11 ARM64 con la carpeta compartida `TarjetaAdicional`: SMB 1 apagado, firma obligatoria y cifrado obligatorio |
 
 ## Estructura
@@ -32,7 +32,8 @@ cliente ─POST JSON─▶ sd-generar-solicitud-tarjeta-pdf ─PUT application/p
 │   ├── carga-40tps.js
 │   ├── carga.js
 │   ├── rafaga.js
-│   └── muestrear.py
+│   ├── muestrear.py
+│   └── fuga.sh                             # prueba de fuga de memoria (memoria viva tras GC forzado)
 └── windows/                                # disco de la VM de Windows (NO está en git)
 ```
 
@@ -154,8 +155,8 @@ Otras operaciones:
 
 | Operación | Petición | Respuestas |
 |---|---|---|
-| Guardar o reemplazar | `PUT /v1/pdfs/{id}`, cuerpo `application/pdf`, `Content-Length` obligatorio, `Content-Digest: sha-256=:<base64>:` opcional | `201` nuevo con `Location` y `ETag`, `200` reemplazo, `400` id o digest inválido o cuerpo incompleto, `411` sin `Content-Length`, `413` más de 20 MB, `415` no es `application/pdf`, `422` no empieza con `%PDF-`, `502` falla SMB |
-| Leer | `GET /v1/pdfs/{id}` | `200` con `Content-Length`, `404`, `502` |
+| Guardar o reemplazar | `PUT /v1/pdfs/{id}`, cuerpo `application/pdf`, `Content-Length` obligatorio, `Content-Digest: sha-256=:<base64>:` opcional | `201` nuevo con `Location` y `ETag`, `200` reemplazo, `400` id o digest inválido o cuerpo incompleto, `411` sin `Content-Length`, `413` más de 20 MB, `415` no es `application/pdf`, `422` no empieza con `%PDF-`, `502` falla SMB, `503` circuito abierto (con `Retry-After`), `504` Windows no respondió a tiempo |
+| Leer | `GET /v1/pdfs/{id}` | `200` con `Content-Length`, `404`, `502`, `503`, `504` |
 
 Errores en `application/problem+json` (RFC 9457). `{id}`: de 1 a 64 letras, números o guiones.
 
@@ -177,6 +178,31 @@ Errores en `application/problem+json` (RFC 9457). `{id}`: de 1 a 64 letras, núm
 | Conexión rota | Se descarta y se reintenta una vez con una nueva, antes de leer el cuerpo |
 | Apagado | Cierra todas las conexiones libres (`TreeDisconnect`, `Logoff`, cierre TCP) |
 
+## Timeouts y circuit breaker
+
+Cada salto tiene su tiempo máximo y su circuit breaker, y los tiempos crecen hacia el cliente:
+
+| Salto | Timeout | Circuit breaker | Respuesta |
+|---|---|---|---|
+| proxy → Windows | `SMB_TIMEOUT_CONEXION_SEGUNDOS` (3 s) para abrir la conexión y `SMB_TIMEOUT_OPERACION_SEGUNDOS` (5 s) por respuesta SMB | Se abre 15 s si falla el 50 % de al menos 5 aperturas de conexión en 30 s | `504` por timeout, `503` con `Retry-After` con el circuito abierto |
+| sd → proxy | `PROXY_TIMEOUT_SEGUNDOS` (10 s) por intento, 3 reintentos con espera de 2, 4 y 8 s | Se abre 5 s si falla el 10 % de al menos 100 intentos en 30 s | `504` por timeout, `503` sin conexión o circuito abierto, `502` si el proxy respondió con error |
+
+- `SMB_TIMEOUT_CONEXION_SEGUNDOS` + `SMB_TIMEOUT_OPERACION_SEGUNDOS` (8 s) debe ser **menor** que
+  `PROXY_TIMEOUT_SEGUNDOS` (10 s): así el proxy responde `504` antes de que el sd corte el intento.
+- El circuito del proxy también protege la cuenta de Windows: un login fallido cuenta como falla, y
+  con el circuito abierto cada réplica intenta un login solo cada 15 s en lugar de uno por petición,
+  lo que evita que una clave incorrecta bloquee la cuenta en segundos.
+
+Medido: con Windows inalcanzable, 5 × `504` de 3 s y luego `503` en 1 ms. Con Windows congelado
+(`docker pause`), `504` en 8 s la petición en curso, 3 × `504` en 3 s, luego `503` en 1 ms, y el
+circuito se cierra solo al descongelar. Con el balanceador detenido, el sd responde `503` y se
+recupera solo. Detalle en el README de cada servicio.
+
+**Hallazgo: el sd espera el `Retry-After` del proxy.** Con el circuito del proxy abierto, el sd
+respeta `Retry-After: 15` en cada reintento y responde `502` a los 38 s, en lugar de fallar rápido.
+No pierde peticiones ni pasa del timeout total (55 s), pero retiene al cliente. Si se quiere fallar
+rápido, hay que no reintentar los `503` del proxy o ignorar `Retry-After` en el sd.
+
 ## Configuración
 
 Cada servicio tiene su README con la descripción, la API y todas sus variables de entorno:
@@ -191,10 +217,18 @@ Cada servicio tiene su README con la descripción, la API y todas sus variables 
 | `SMB_MAX_CONEXIONES` | 8 | proxy |
 | `SMB_INACTIVIDAD_SEGUNDOS` | 30 | proxy |
 | `SMB_VIDA_MAXIMA_MINUTOS` | 10 | proxy |
+| `SMB_TIMEOUT_CONEXION_SEGUNDOS` | 3 | proxy. Tiempo máximo para abrir una conexión SMB (DNS, TCP, login y `TreeConnect`) |
+| `SMB_TIMEOUT_OPERACION_SEGUNDOS` | 5 | proxy. Espera máxima de cada respuesta SMB |
+| `SMB_CB_PROPORCION_FALLAS` / `SMB_CB_MINIMO_INTENTOS` | 0.5 / 5 | proxy. Circuit breaker al abrir conexiones con Windows |
+| `SMB_CB_VENTANA_SEGUNDOS` / `SMB_CB_DURACION_ABIERTO_SEGUNDOS` | 30 / 15 | proxy |
 | `PROXY_TIMEOUT_SEGUNDOS` | 10 | sd. Timeout de cada intento contra el proxy. El sd no usa pool de conexiones: abre una por petición |
+| `PROXY_REINTENTOS` / `PROXY_REINTENTO_ESPERA_MS` | 3 / 2000 | sd. Reintentos y espera base exponencial. `0` reintentos los desactiva |
+| `PROXY_CB_PROPORCION_FALLAS` / `PROXY_CB_MINIMO_INTENTOS` | 0.1 / 100 | sd. Circuit breaker hacia el proxy |
+| `PROXY_CB_VENTANA_SEGUNDOS` / `PROXY_CB_DURACION_ABIERTO_SEGUNDOS` | máx(30, 2 × timeout) / 5 | sd |
+| `DIAGNOSTICO_GC` | `false` | ambos. Habilita `POST /diagnostico/gc` (GC forzado y memoria viva) para pruebas de fuga. Solo laboratorio |
 
 Se pueden cambiar con variables de entorno o un archivo `.env` (ignorado en git). La clave es solo
-del laboratorio.
+del laboratorio. Un valor numérico inválido o fuera de rango impide que el servicio arranque.
 
 ## Pruebas de carga
 
@@ -226,8 +260,68 @@ Resultados obtenidos en el laboratorio (host ARM64, Windows 11 en VM):
 | 40 TPS, 4 réplicas, 5 min | 12.001 peticiones, 0 errores, p95 14,7 ms. 4 a 5 conexiones SMB en total, 0 esperas |
 | 40 TPS, 1 réplica, 5 min | 0 errores, p95 14,1 ms. 5 conexiones creadas y 11.996 reutilizadas, máximo 4 en uso a la vez |
 | 100 TPS, 1 réplica, 5 min | 30.001 peticiones, 0 errores, p95 16,8 ms, p99 56,5 ms. Llega al límite de 8 conexiones en picos: 0,11 % esperó hasta 75 ms |
+| 100 TPS, 1 réplica, 5 min, con timeouts y circuit breaker | 4 corridas de 30.000 peticiones: 0 errores, p95 16 a 17,5 ms, p99 63 a 66 ms. El circuito nunca se abrió |
+| Fuga de memoria (`carga/fuga.sh`) | Memoria viva tras GC forzado, al calentar / tras 5 min / tras 10 min a 100 TPS: proxy 18,15 / 18,18 / 17,79 MB, sd 1,55 / 1,56 / 1,57 MB. **Sin fuga.** Hilos, descriptores y conexiones al 445 (0 en reposo) vuelven a la línea base |
 | Ráfaga, 100 usuarios con PDF de 4 MB | 0 errores, 516 MB/s, nunca más de 8 conexiones |
 | Hilos y memoria | Cola del ThreadPool en 0 o 1, 40 a 70 MB por réplica, sin errores en los logs |
+
+## Pruebas de timeouts y circuit breaker
+
+La configuración del repositorio es la normal. Estas pruebas cambian variables **solo en el
+`docker compose up` de cada paso**; el último comando de cada una vuelve a la configuración normal.
+Requieren el demo levantado y un PDF de prueba (`sol.pdf` del paso 4 de [Cómo ejecutar
+todo](#cómo-ejecutar-todo)).
+
+```bash
+# Envía 8 PDF al proxy y muestra código, tiempo y Retry-After de cada respuesta.
+enviar() { for i in $(seq 1 8); do
+  curl -s -o /dev/null -D - -w '%{http_code} %{time_total}s\n' -X PUT localhost:8086/v1/pdfs/CB-$i \
+    -H 'Content-Type: application/pdf' --data-binary @sol.pdf | grep -E '^(Retry-After|[0-9]{3} )'; done; }
+circuito() { curl -s $(docker compose port --index 1 proxy-guardar-pdf 8080)/metricas \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['smb']['circuito'])"; }
+```
+
+**1. Windows inalcanzable** (timeout de conexión y circuito del proxy):
+
+```bash
+SMB_SERVIDOR=10.255.255.1 docker compose up -d proxy-guardar-pdf
+docker restart demo-smb-tarjeta-adicional-balanceador-proxy-1
+enviar; circuito            # 5 × 504 en 3 s (timeout de conexión), se abre el circuito y 3 × 503 en ~1 ms con Retry-After: 15
+docker compose up -d proxy-guardar-pdf && docker restart demo-smb-tarjeta-adicional-balanceador-proxy-1
+```
+
+**2. Windows congelado** (timeout de operación con conexiones ya abiertas):
+
+```bash
+enviar                      # 201/200: deja conexiones abiertas en el pool
+docker pause demo-smb-tarjeta-adicional-windows-1
+enviar; circuito            # 504 en 8 s la petición con conexión abierta, 3 × 504 en 3 s, luego 503 en ~1 ms
+docker unpause demo-smb-tarjeta-adicional-windows-1
+sleep 16; enviar; circuito  # pasados 15 s la conexión de prueba funciona: 200 y circuito Closed
+```
+
+**3. Proxy caído** (reintentos y circuito del sd), con valores bajados para que el circuito se abra
+con pocas peticiones:
+
+```bash
+PROXY_REINTENTOS=1 PROXY_REINTENTO_ESPERA_MS=200 PROXY_CB_MINIMO_INTENTOS=10 PROXY_CB_PROPORCION_FALLAS=0.5 \
+  docker compose up -d --no-deps sd-generar-solicitud-tarjeta-pdf
+docker compose stop balanceador-proxy
+for i in $(seq 1 10); do curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' -X POST \
+  localhost:8081/v1/solicitudes-tarjeta-adicional/CB-$i/pdf -H 'Content-Type: application/json' \
+  -d '{"titularPrincipal":"Prueba","ultimosDigitosTarjetaPrincipal":"4821","nombreAdicional":"Prueba",
+       "identificacionAdicional":"1712345678","parentesco":"Hijo","cupoAsignado":100}'; done
+                            # 5 × 503 en 0,1 a 0,4 s (2 intentos), se abre el circuito y 5 × 503 en ~1 ms
+docker compose start balanceador-proxy
+docker compose up -d --no-deps sd-generar-solicitud-tarjeta-pdf   # vuelve a la configuración normal
+```
+
+`--no-deps` evita que `up` vuelva a levantar el balanceador detenido.
+
+**4. Fuga de memoria** (unos 13 minutos): `mkdir -p resultados && carga/fuga.sh | tee resultados/fuga.log`.
+Levanta el proxy y el sd con `DIAGNOSTICO_GC=true`, mide la memoria viva tras un GC forzado al
+calentar (W), tras 5 min a 100 TPS (A) y tras otros 5 min (B), y al terminar los deja con la
+configuración normal. Si B ≈ A no hay fuga.
 
 ## Problemas comunes
 
@@ -238,4 +332,6 @@ Resultados obtenidos en el laboratorio (host ARM64, Windows 11 en VM):
 | `exec format error` o la VM no arranca en x86_64 | Cambiar la imagen por `dockurr/windows:6.06` |
 | El puerto 8006, 8081 u 8086 está ocupado | Cambiar el puerto del host en `docker-compose.yml` |
 | `502` del proxy | Revisar `docker compose logs proxy-guardar-pdf`. Con `STATUS_LOGON_FAILURE`, la clave no coincide con `oem/configurar-smb.ps1` |
+| `504` del proxy | Windows no respondió dentro de `SMB_TIMEOUT_CONEXION_SEGUNDOS` o `SMB_TIMEOUT_OPERACION_SEGUNDOS`: está apagado, arrancando o congelado |
+| `503` del proxy con `Retry-After` | Circuito abierto tras fallas seguidas con Windows. Se prueba de nuevo solo pasados `SMB_CB_DURACION_ABIERTO_SEGUNDOS`; el estado está en `/metricas` (`smb.circuito`) |
 | El balanceador no ve réplicas nuevas | `docker restart demo-smb-tarjeta-adicional-balanceador-proxy-1` |

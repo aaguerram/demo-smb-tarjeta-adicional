@@ -23,16 +23,25 @@ compartida de Windows. No sabe nada de SMB ni de Windows: solo conoce la URL del
 | Variable | Obligatoria | Por defecto | Ejemplo | Descripción |
 |---|---|---|---|---|
 | `PROXY_GUARDAR_PDF_URL` | Sí | | `http://proxy-guardar-pdf:8080/` | URL base de proxy-guardar-pdf (en OpenShift, el `Service` del proxy). Debe ser `http` o `https` absoluta. Si no termina en `/`, se agrega |
-| `PROXY_TIMEOUT_SEGUNDOS` | No | `10` | `5` | Tiempo máximo de cada intento contra el proxy: conexión, envío del PDF y respuesta. De 1 a 300 |
+| `PROXY_TIMEOUT_SEGUNDOS` | No | `10` | `5` | Tiempo máximo de cada intento contra el proxy: conexión, envío del PDF y respuesta. De 1 a 300. Debe ser mayor que `SMB_TIMEOUT_CONEXION_SEGUNDOS` + `SMB_TIMEOUT_OPERACION_SEGUNDOS` del proxy (ver [Timeout y reintentos](#conexión-al-proxy)) |
+| `PROXY_REINTENTOS` | No | `3` | `0` | Reintentos después del primer intento. `0` los desactiva. De 0 a 10 |
+| `PROXY_REINTENTO_ESPERA_MS` | No | `2000` | `500` | Espera base antes del primer reintento. Se duplica en cada reintento, con variación aleatoria. De 0 a 60000 |
+| `PROXY_CB_PROPORCION_FALLAS` | No | `0.1` | `0.5` | Proporción de intentos fallidos que abre el circuito. De 0.01 a 1 |
+| `PROXY_CB_MINIMO_INTENTOS` | No | `100` | `20` | Mínimo de intentos dentro de la ventana para poder abrir el circuito. De 2 a 100000 |
+| `PROXY_CB_VENTANA_SEGUNDOS` | No | 30 o 2 × `PROXY_TIMEOUT_SEGUNDOS`, el mayor | `60` | Ventana en la que se cuentan las fallas. Debe ser al menos 2 × `PROXY_TIMEOUT_SEGUNDOS`. De 1 a 3600 |
+| `PROXY_CB_DURACION_ABIERTO_SEGUNDOS` | No | `5` | `30` | Segundos que el circuito queda abierto antes de probar de nuevo. De 1 a 3600 |
+| `DIAGNOSTICO_GC` | No | `false` | `true` | Habilita `POST /diagnostico/gc` para pruebas de fuga de memoria. No activar en producción |
 | `ASPNETCORE_HTTP_PORTS` | No | `8080` (fijado en el `Dockerfile`) | `8080` | Puerto HTTP de la API |
 | `Logging__LogLevel__Default` | No | `Information` | `Warning` | Nivel de log de ASP.NET Core |
 
-Si `PROXY_GUARDAR_PDF_URL` falta o no es una URL `http(s)` absoluta, o si `PROXY_TIMEOUT_SEGUNDOS`
-está fuera de 1 a 300, el proceso no arranca: escribe el motivo en stderr y termina con código 1.
+Si `PROXY_GUARDAR_PDF_URL` falta o no es una URL `http(s)` absoluta, si una variable numérica no
+es un número o está fuera de su rango, o si la ventana del circuito es menor que el doble del
+timeout, el proceso no arranca: escribe el motivo en stderr y termina con código 1.
 
 ```text
 Falta la variable de entorno PROXY_GUARDAR_PDF_URL
 PROXY_GUARDAR_PDF_URL no es una URL http(s) absoluta: proxy-guardar-pdf:8080
+PROXY_CB_VENTANA_SEGUNDOS (15) debe ser al menos el doble de PROXY_TIMEOUT_SEGUNDOS (10)
 ```
 
 No necesita credenciales: la cuenta de Windows solo la tiene el proxy.
@@ -43,7 +52,8 @@ No necesita credenciales: la cuenta de Windows solo la tiene el proxy.
 |---|---|---|
 | Generar y guardar | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf` con la solicitud en JSON | `201`, `400`, `502`, `503`, `504` |
 | Salud | `GET /salud` | `200 OK` `{"estado":"ok"}` |
-| Métricas | `GET /metricas` | Hilos, ThreadPool, memoria y GC. Pensado para pruebas de carga, no para exponer fuera del clúster |
+| Métricas | `GET /metricas` | Hilos, ThreadPool, descriptores abiertos, memoria (`heapTrasGcMB`, `gen2TrasGcMB`) y GC. Pensado para pruebas de carga, no para exponer fuera del clúster |
+| Forzar GC | `POST /diagnostico/gc` | Solo con `DIAGNOSTICO_GC=true`. Fuerza un GC completo y compactante y devuelve la memoria que sigue viva (`vivoMB`) y las métricas del proceso |
 
 `{id}`: identificador de la solicitud, de 1 a 64 letras, números o guiones. El PDF se guarda como
 `{id}.pdf`.
@@ -90,7 +100,7 @@ Errores en `application/problem+json` (RFC 9457):
 | Código | Cuándo |
 |---|---|
 | `400` | Id inválido o datos de la solicitud inválidos. `detail` lista todos los errores, por ejemplo `titularPrincipal es obligatorio. cupoAsignado debe ser mayor a 0.` |
-| `502` | El proxy respondió con error después de los reintentos (por ejemplo, falla SMB con Windows). `detail` incluye la respuesta del proxy |
+| `502` | El proxy respondió con error después de los reintentos (por ejemplo, falla SMB con Windows, o el proxy respondió `503` o `504` porque Windows no está disponible). `detail` incluye la respuesta del proxy |
 | `503` | No se pudo conectar con el proxy después de los reintentos, o el circuito está abierto |
 | `504` | El proxy no respondió dentro de `PROXY_TIMEOUT_SEGUNDOS` en ninguno de los intentos |
 
@@ -108,14 +118,30 @@ conexión en `TIME_WAIT` durante 60 s en el lado que recibe (unas 2.400 a 40 TPS
 
 | Mecanismo | Valor |
 |---|---|
-| Timeout por intento | `PROXY_TIMEOUT_SEGUNDOS` (10 s por defecto). `HttpClient.Timeout` queda desactivado |
-| Reintentos | Hasta 3, con espera exponencial y variación aleatoria, ante `5xx`, `408`, `429`, errores de red y timeout de un intento. Cada reintento abre su propia conexión |
-| Timeout total | 4 × `PROXY_TIMEOUT_SEGUNDOS` + 15 s, incluidos los reintentos |
-| Circuit breaker | Se abre 5 s si falla el 10 % de al menos 100 peticiones en la ventana (30 s o el doble del timeout, lo que sea mayor) |
+| Timeout por intento | `PROXY_TIMEOUT_SEGUNDOS` (10 s). `HttpClient.Timeout` queda desactivado |
+| Reintentos | `PROXY_REINTENTOS` (3) ante `5xx`, `408`, `429`, errores de red y timeout de un intento. Espera exponencial desde `PROXY_REINTENTO_ESPERA_MS` (2 s, 4 s, 8 s), con variación aleatoria. Cada reintento abre su propia conexión |
+| Timeout total | Todos los intentos más las esperas, con 1 s de margen: `PROXY_TIMEOUT_SEGUNDOS` × (`PROXY_REINTENTOS` + 1) + `PROXY_REINTENTO_ESPERA_MS` × (2^`PROXY_REINTENTOS` − 1) + 1 s. Con los valores por defecto, 4 × 10 s + 14 s + 1 s = 55 s |
+| Circuit breaker | Se abre `PROXY_CB_DURACION_ABIERTO_SEGUNDOS` (5 s) si falla al menos `PROXY_CB_PROPORCION_FALLAS` (10 %) de al menos `PROXY_CB_MINIMO_INTENTOS` (100) intentos en `PROXY_CB_VENTANA_SEGUNDOS` (30 s o el doble del timeout, lo que sea mayor) |
 
-Reintentar es seguro porque el `PUT` al proxy es idempotente. Medido:
+Reintentar es seguro porque el `PUT` al proxy es idempotente.
+
+**El timeout del sd debe ser mayor que el del proxy.** El proxy puede tardar hasta
+`SMB_TIMEOUT_CONEXION_SEGUNDOS` + `SMB_TIMEOUT_OPERACION_SEGUNDOS` (3 s + 5 s = 8 s) en responder
+`504` cuando Windows no contesta. Con `PROXY_TIMEOUT_SEGUNDOS` (10 s) por encima de esa suma, el sd
+recibe la respuesta del proxy y sabe qué pasó; si fuera menor, cortaría el intento antes y lo
+reintentaría mientras el proxy sigue esperando a Windows.
+
+El proxy tiene su propio circuit breaker hacia Windows: cuando está abierto responde `503` al instante
+con `Retry-After`, así que los reintentos del sd no llegan a Windows. El manejador estándar respeta
+`Retry-After`: cada reintento espera 15 s en lugar de la espera exponencial, y el sd responde `502` a
+los 38 s (medido con Windows inalcanzable). No pasa del timeout total, pero retiene al cliente. Para
+fallar rápido habría que no reintentar los `503` del proxy o ignorar `Retry-After`.
+
+Medido:
 
 - Con el balanceador detenido, el sd responde `503` en unos 6 s y se recupera solo.
+- Con el balanceador detenido y los valores bajados por variables para la prueba, cada petición hizo
+  2 intentos, el circuito se abrió tras 10 intentos fallidos y se cerró solo al volver el balanceador.
 - Con el proxy congelado y `PROXY_TIMEOUT_SEGUNDOS=2`, hace 4 intentos de 2 s y responde `504` en 14,3 s.
 
 ## Generación del PDF
@@ -170,5 +196,5 @@ controlada puede dejarlo colgado en lugar de terminar. La sonda hace que el clú
 | `Program.cs` | Configuración, validación de la URL y de la solicitud, endpoint y mapeo de errores |
 | `GeneradorPdf.cs` | Generación del PDF en memoria |
 | `ClienteProxyPdf.cs` | Envío del PDF al proxy con `PUT` binario, `Content-Length` y `Content-Digest` |
-| `MetricasProceso.cs` | Hilos, ThreadPool, memoria y GC para `/metricas` |
+| `MetricasProceso.cs` | Hilos, ThreadPool, descriptores, memoria y GC para `/metricas` |
 | `Dockerfile` | Compilación y ejecución sobre imágenes Red Hat UBI 9 |
