@@ -13,8 +13,9 @@ compartida de Windows. No sabe nada de SMB ni de Windows: solo conoce la URL del
 3. **Envía el PDF al proxy** con `PUT /v1/pdfs/{id}` en binario: `Content-Type: application/pdf`,
    `Content-Length` y `Content-Digest` con el SHA-256 (RFC 9530). Es la forma más eficiente: viajan
    solo los bytes del PDF, sin Base64 (que agrega 33 %) ni `multipart`.
-4. **Reintenta si el proxy falla.** Es seguro porque el `PUT` con el id de la solicitud es
-   idempotente: un reintento reemplaza el mismo archivo y no lo duplica.
+4. **Abre una conexión por petición, con timeout y reintentos.** Sin pool de conexiones, con un
+   timeout configurable por intento (`PROXY_TIMEOUT_SEGUNDOS`). Reintentar es seguro porque el `PUT`
+   con el id de la solicitud es idempotente: un reintento reemplaza el mismo archivo.
 5. **Responde `201`** con la ubicación, el tamaño y el SHA-256 del PDF guardado.
 
 ## Variables de entorno
@@ -22,11 +23,12 @@ compartida de Windows. No sabe nada de SMB ni de Windows: solo conoce la URL del
 | Variable | Obligatoria | Por defecto | Ejemplo | Descripción |
 |---|---|---|---|---|
 | `PROXY_GUARDAR_PDF_URL` | Sí | | `http://proxy-guardar-pdf:8080/` | URL base de proxy-guardar-pdf (en OpenShift, el `Service` del proxy). Debe ser `http` o `https` absoluta. Si no termina en `/`, se agrega |
+| `PROXY_TIMEOUT_SEGUNDOS` | No | `10` | `5` | Tiempo máximo de cada intento contra el proxy: conexión, envío del PDF y respuesta. De 1 a 300 |
 | `ASPNETCORE_HTTP_PORTS` | No | `8080` (fijado en el `Dockerfile`) | `8080` | Puerto HTTP de la API |
 | `Logging__LogLevel__Default` | No | `Information` | `Warning` | Nivel de log de ASP.NET Core |
 
-Si `PROXY_GUARDAR_PDF_URL` falta o no es una URL `http(s)` absoluta, el proceso no arranca: escribe
-el motivo en stderr y termina con código 1.
+Si `PROXY_GUARDAR_PDF_URL` falta o no es una URL `http(s)` absoluta, o si `PROXY_TIMEOUT_SEGUNDOS`
+está fuera de 1 a 300, el proceso no arranca: escribe el motivo en stderr y termina con código 1.
 
 ```text
 Falta la variable de entorno PROXY_GUARDAR_PDF_URL
@@ -39,7 +41,7 @@ No necesita credenciales: la cuenta de Windows solo la tiene el proxy.
 
 | Operación | Petición | Respuestas |
 |---|---|---|
-| Generar y guardar | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf` con la solicitud en JSON | `201`, `400`, `502`, `503` |
+| Generar y guardar | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf` con la solicitud en JSON | `201`, `400`, `502`, `503`, `504` |
 | Salud | `GET /salud` | `200 OK` `{"estado":"ok"}` |
 | Métricas | `GET /metricas` | Hilos, ThreadPool, memoria y GC. Pensado para pruebas de carga, no para exponer fuera del clúster |
 
@@ -89,23 +91,32 @@ Errores en `application/problem+json` (RFC 9457):
 |---|---|
 | `400` | Id inválido o datos de la solicitud inválidos. `detail` lista todos los errores, por ejemplo `titularPrincipal es obligatorio. cupoAsignado debe ser mayor a 0.` |
 | `502` | El proxy respondió con error después de los reintentos (por ejemplo, falla SMB con Windows). `detail` incluye la respuesta del proxy |
-| `503` | No se pudo hablar con el proxy: sin conexión, sin respuesta a tiempo o circuito abierto |
+| `503` | No se pudo conectar con el proxy después de los reintentos, o el circuito está abierto |
+| `504` | El proxy no respondió dentro de `PROXY_TIMEOUT_SEGUNDOS` en ninguno de los intentos |
 
-## Reintentos y tiempos
+## Conexión al proxy
 
-El cliente HTTP del proxy usa `AddStandardResilienceHandler` de `Microsoft.Extensions.Http.Resilience`
-con sus valores por defecto:
+**Sin pool de conexiones.** Cada petición abre su propia conexión HTTP al proxy y se cierra al terminar:
+el cliente envía `Connection: close` en todas las peticiones. Así cada petición pasa por el `Service`
+y se reparte entre las réplicas del proxy. El cliente se obtiene de `IHttpClientFactory`
+(`AddHttpClient<ClienteProxyPdf>`), así que nunca se crea un `HttpClient` por petición.
+
+Costo medido a 40 TPS: p95 de 17,1 ms contra 16,3 ms reutilizando conexiones. Cada petición deja una
+conexión en `TIME_WAIT` durante 60 s en el lado que recibe (unas 2.400 a 40 TPS).
+
+**Timeout y reintentos.** `AddStandardResilienceHandler` de `Microsoft.Extensions.Http.Resilience`:
 
 | Mecanismo | Valor |
 |---|---|
-| Reintentos | Hasta 3, con espera exponencial y variación aleatoria, ante `5xx`, `408`, `429` y errores de red |
-| Timeout por intento | 10 s |
-| Timeout total | 30 s, incluidos los reintentos |
-| Circuit breaker | Se abre 5 s si falla el 10 % de al menos 100 peticiones en 30 s |
+| Timeout por intento | `PROXY_TIMEOUT_SEGUNDOS` (10 s por defecto). `HttpClient.Timeout` queda desactivado |
+| Reintentos | Hasta 3, con espera exponencial y variación aleatoria, ante `5xx`, `408`, `429`, errores de red y timeout de un intento. Cada reintento abre su propia conexión |
+| Timeout total | 4 × `PROXY_TIMEOUT_SEGUNDOS` + 15 s, incluidos los reintentos |
+| Circuit breaker | Se abre 5 s si falla el 10 % de al menos 100 peticiones en la ventana (30 s o el doble del timeout, lo que sea mayor) |
 
-Con el proxy caído, el sd responde `503` en unos 6 s (después de los reintentos) y se recupera solo
-cuando el proxy vuelve. `IHttpClientFactory` renueva las conexiones HTTP cada 2 minutos, así que con
-varias réplicas del proxy detrás de un `Service` las peticiones se reparten entre ellas.
+Reintentar es seguro porque el `PUT` al proxy es idempotente. Medido:
+
+- Con el balanceador detenido, el sd responde `503` en unos 6 s y se recupera solo.
+- Con el proxy congelado y `PROXY_TIMEOUT_SEGUNDOS=2`, hace 4 intentos de 2 s y responde `504` en 14,3 s.
 
 ## Generación del PDF
 
@@ -138,6 +149,8 @@ necesita `/tmp` escribible), como la SCC `restricted-v2` de OpenShift.
 env:
   - name: PROXY_GUARDAR_PDF_URL
     value: http://proxy-guardar-pdf:8080/
+  - name: PROXY_TIMEOUT_SEGUNDOS
+    value: "10"
 readinessProbe:
   httpGet: { path: /salud, port: 8080 }
 livenessProbe:

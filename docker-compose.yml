@@ -89,6 +89,7 @@ services:
       - /tmp
     environment:
       PROXY_GUARDAR_PDF_URL: http://balanceador-proxy:8080/
+      PROXY_TIMEOUT_SEGUNDOS: ${PROXY_TIMEOUT_SEGUNDOS:-10}
     ports:
       - "127.0.0.1:8081:8080"
     depends_on:

@@ -11,7 +11,7 @@ cliente ─POST JSON─▶ sd-generar-solicitud-tarjeta-pdf ─PUT application/p
 
 | Servicio | Tecnología | Qué hace |
 |---|---|---|
-| `sd-generar-solicitud-tarjeta-pdf` | .NET 10, imagen Red Hat UBI 9 | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf`: genera el PDF y lo envía al proxy con `PUT` binario, `Content-Length` y `Content-Digest` (SHA-256). Reintentos con `AddStandardResilienceHandler` |
+| `sd-generar-solicitud-tarjeta-pdf` | .NET 10, imagen Red Hat UBI 9 | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf`: genera el PDF y lo envía al proxy con `PUT` binario, `Content-Length` y `Content-Digest` (SHA-256). Una conexión por petición, timeout configurable y reintentos con `AddStandardResilienceHandler` |
 | `balanceador-proxy` | nginx 1.28 | Reparte cada petición en round-robin entre las réplicas del proxy, sin guardar el PDF en búfer |
 | `proxy-guardar-pdf` | .NET 10, SMBLibrary 1.5.8.1, UBI 9 | `PUT` y `GET /v1/pdfs/{id}`. Copia el cuerpo por bloques de 64 KB a un temporal y lo renombra si el SHA-256 coincide. Pool acotado de conexiones SMB |
 | `windows` | `dockurr/windows-arm:6.06` | Windows 11 ARM64 con la carpeta compartida `TarjetaAdicional`: SMB 1 apagado, firma obligatoria y cifrado obligatorio |
@@ -163,7 +163,7 @@ Errores en `application/problem+json` (RFC 9457). `{id}`: de 1 a 64 letras, núm
 
 | Operación | Petición | Respuestas |
 |---|---|---|
-| Generar y guardar | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf` con `titularPrincipal`, `ultimosDigitosTarjetaPrincipal`, `nombreAdicional`, `identificacionAdicional`, `parentesco` y `cupoAsignado` | `201` con ubicación, tamaño y SHA-256 del PDF, `400` con todos los errores de validación, `502` si el proxy lo rechazó, `503` si el proxy no responde (sin conexión, timeout o circuito abierto) |
+| Generar y guardar | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf` con `titularPrincipal`, `ultimosDigitosTarjetaPrincipal`, `nombreAdicional`, `identificacionAdicional`, `parentesco` y `cupoAsignado` | `201` con ubicación, tamaño y SHA-256 del PDF, `400` con todos los errores de validación, `502` si el proxy lo rechazó, `503` si no hay conexión con el proxy o el circuito está abierto, `504` si el proxy no responde a tiempo |
 
 ## Pool de conexiones SMB
 
@@ -191,6 +191,7 @@ Cada servicio tiene su README con la descripción, la API y todas sus variables 
 | `SMB_MAX_CONEXIONES` | 8 | proxy |
 | `SMB_INACTIVIDAD_SEGUNDOS` | 30 | proxy |
 | `SMB_VIDA_MAXIMA_MINUTOS` | 10 | proxy |
+| `PROXY_TIMEOUT_SEGUNDOS` | 10 | sd. Timeout de cada intento contra el proxy. El sd no usa pool de conexiones: abre una por petición |
 
 Se pueden cambiar con variables de entorno o un archivo `.env` (ignorado en git). La clave es solo
 del laboratorio.

@@ -21,11 +21,34 @@ if (!Uri.TryCreate(urlProxy, UriKind.Absolute, out var baseProxy) || baseProxy.S
 if (!baseProxy.AbsolutePath.EndsWith('/'))
     baseProxy = new Uri(baseProxy + "/");
 
+// Tiempo máximo de cada intento contra el proxy (conexión, envío del PDF y respuesta).
+var segundosTimeout = builder.Configuration.GetValue("PROXY_TIMEOUT_SEGUNDOS", 10);
+if (segundosTimeout is < 1 or > 300)
+{
+    Console.Error.WriteLine($"PROXY_TIMEOUT_SEGUNDOS debe estar entre 1 y 300: {segundosTimeout}");
+    Environment.Exit(1);
+}
+var timeoutIntento = TimeSpan.FromSeconds(segundosTimeout);
+
 builder.Services.AddProblemDetails();
-builder.Services.AddHttpClient<ClienteProxyPdf>(c => c.BaseAddress = baseProxy)
-    // Reintentos con espera exponencial, timeout por intento y circuit breaker.
-    // Es seguro reintentar porque el proxy usa PUT con el id de la solicitud (idempotente).
-    .AddStandardResilienceHandler();
+builder.Services.AddHttpClient<ClienteProxyPdf>(c =>
+    {
+        c.BaseAddress = baseProxy;
+        // Sin pool de conexiones: cada petición abre su conexión y el proxy la cierra al responder.
+        c.DefaultRequestHeaders.ConnectionClose = true;
+        // Los tiempos los controla el manejador de resiliencia, no HttpClient.Timeout.
+        c.Timeout = Timeout.InfiniteTimeSpan;
+    })
+    // Reintentos con espera exponencial y circuit breaker. Es seguro reintentar porque el proxy
+    // usa PUT con el id de la solicitud (idempotente).
+    .AddStandardResilienceHandler(o =>
+    {
+        o.AttemptTimeout.Timeout = timeoutIntento;
+        // Total: los 4 intentos (1 + 3 reintentos) más las esperas entre ellos.
+        o.TotalRequestTimeout.Timeout = timeoutIntento * 4 + TimeSpan.FromSeconds(15);
+        // El circuit breaker exige una ventana de al menos el doble del timeout por intento.
+        o.CircuitBreaker.SamplingDuration = TimeSpan.FromSeconds(Math.Max(30, segundosTimeout * 2));
+    });
 
 var app = builder.Build();
 app.UseExceptionHandler();
@@ -61,9 +84,15 @@ app.MapPost("/v1/solicitudes-tarjeta-adicional/{id}/pdf", async (string id, Soli
         log.LogError(ex, "El proxy rechazó el PDF de {Id}", id);
         return Results.Problem(statusCode: 502, title: "No se pudo guardar el PDF", detail: ex.Message);
     }
-    catch (Exception ex) when (ex is HttpRequestException or TimeoutRejectedException or BrokenCircuitException)
+    catch (TimeoutRejectedException ex)
     {
-        // Sin conexión, sin respuesta a tiempo tras los reintentos, o circuito abierto por fallas seguidas.
+        // El proxy no respondió dentro de PROXY_TIMEOUT_SEGUNDOS en ningún intento.
+        log.LogError(ex, "Timeout del proxy para {Id}", id);
+        return Results.Problem(statusCode: 504, title: "proxy-guardar-pdf no respondió a tiempo", detail: ex.Message);
+    }
+    catch (Exception ex) when (ex is HttpRequestException or BrokenCircuitException)
+    {
+        // Sin conexión tras los reintentos, o circuito abierto por fallas seguidas.
         log.LogError(ex, "Proxy no disponible para {Id}", id);
         return Results.Problem(statusCode: 503, title: "proxy-guardar-pdf no disponible", detail: ex.Message);
     }
