@@ -164,7 +164,7 @@ Errores en `application/problem+json` (RFC 9457). `{id}`: de 1 a 64 letras, núm
 
 | Operación | Petición | Respuestas |
 |---|---|---|
-| Generar y guardar | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf` con `titularPrincipal`, `ultimosDigitosTarjetaPrincipal`, `nombreAdicional`, `identificacionAdicional`, `parentesco` y `cupoAsignado` | `201` con ubicación, tamaño y SHA-256 del PDF, `400` con todos los errores de validación, `502` si el proxy lo rechazó, `503` si no hay conexión con el proxy o algún circuito está abierto (con `Retry-After` si es el del proxy), `504` si el proxy no responde a tiempo |
+| Generar y guardar | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf` con `titularPrincipal`, `ultimosDigitosTarjetaPrincipal`, `nombreAdicional`, `identificacionAdicional`, `parentesco` y `cupoAsignado` | `201` con ubicación, tamaño y SHA-256 del PDF, `400` con todos los errores de validación, `502` si el proxy lo rechazó, `503` si no hay conexión con el proxy o algún circuito está abierto (con `Retry-After` si es el del proxy), `504` si el proxy o Windows no responden a tiempo |
 
 ## Pool de conexiones SMB
 
@@ -185,7 +185,7 @@ Cada salto tiene su tiempo máximo y su circuit breaker, y los tiempos crecen ha
 | Salto | Timeout | Circuit breaker | Respuesta |
 |---|---|---|---|
 | proxy → Windows | `SMB_TIMEOUT_CONEXION_SEGUNDOS` (3 s) para abrir la conexión y `SMB_TIMEOUT_OPERACION_SEGUNDOS` (5 s) por respuesta SMB | Se abre 15 s si falla el 50 % de al menos 5 aperturas de conexión en 30 s | `504` por timeout, `503` con `Retry-After` con el circuito abierto |
-| sd → proxy | `PROXY_TIMEOUT_SEGUNDOS` (10 s) por intento, 3 reintentos con espera de 2, 4 y 8 s | Se abre 5 s si falla el 10 % de al menos 100 intentos en 30 s | `504` por timeout, `503` sin conexión o circuito abierto (sin reintentar los `503` del proxy), `502` si el proxy respondió con error |
+| sd → proxy | `PROXY_TIMEOUT_SEGUNDOS` (10 s) por intento, 3 reintentos con espera de 2, 4 y 8 s | Se abre 5 s si falla el 10 % de al menos 100 intentos en 30 s | `504` por timeout propio o del proxy, `503` sin conexión o circuito abierto (sin reintentar los `503` del proxy), `502` si el proxy respondió con error |
 
 - `SMB_TIMEOUT_CONEXION_SEGUNDOS` + `SMB_TIMEOUT_OPERACION_SEGUNDOS` (8 s) debe ser **menor** que
   `PROXY_TIMEOUT_SEGUNDOS` (10 s): así el proxy responde `504` antes de que el sd corte el intento.

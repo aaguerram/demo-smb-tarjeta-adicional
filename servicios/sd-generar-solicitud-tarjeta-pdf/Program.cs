@@ -136,6 +136,12 @@ app.MapPost("/v1/solicitudes-tarjeta-adicional/{id}/pdf", async (string id, Soli
             http.Response.Headers.RetryAfter = reintentar.ToString();
         return Results.Problem(statusCode: 503, title: "Carpeta compartida no disponible", detail: ex.Message);
     }
+    catch (ProxyPdfException ex) when (ex.Estado == StatusCodes.Status504GatewayTimeout)
+    {
+        // Windows no respondió a tiempo al proxy en ningún intento: es un timeout, no un rechazo.
+        log.LogError("Windows no respondió a tiempo para {Id}: {Mensaje}", id, ex.Message);
+        return Results.Problem(statusCode: 504, title: "La carpeta compartida no respondió a tiempo", detail: ex.Message);
+    }
     catch (ProxyPdfException ex)
     {
         log.LogError(ex, "El proxy rechazó el PDF de {Id}", id);

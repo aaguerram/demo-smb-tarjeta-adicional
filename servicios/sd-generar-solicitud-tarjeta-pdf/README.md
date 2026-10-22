@@ -100,9 +100,9 @@ Errores en `application/problem+json` (RFC 9457):
 | Código | Cuándo |
 |---|---|
 | `400` | Id inválido o datos de la solicitud inválidos. `detail` lista todos los errores, por ejemplo `titularPrincipal es obligatorio. cupoAsignado debe ser mayor a 0.` |
-| `502` | El proxy respondió con error después de los reintentos (por ejemplo, falla SMB con Windows, o `504` porque Windows no respondió a tiempo). `detail` incluye la respuesta del proxy |
+| `502` | El proxy respondió con error después de los reintentos (por ejemplo, falla SMB con Windows o clave incorrecta). `detail` incluye la respuesta del proxy |
 | `503` | No se pudo conectar con el proxy después de los reintentos, el circuito del sd está abierto, o el circuito del proxy hacia Windows está abierto. En este último caso, sin reintentos y con el `Retry-After` del proxy |
-| `504` | El proxy no respondió dentro de `PROXY_TIMEOUT_SEGUNDOS` en ninguno de los intentos |
+| `504` | El proxy no respondió dentro de `PROXY_TIMEOUT_SEGUNDOS` en ninguno de los intentos, o el proxy respondió `504` en todos porque Windows no respondió a tiempo ("La carpeta compartida no respondió a tiempo") |
 
 ## Conexión al proxy
 
@@ -145,7 +145,7 @@ Medido:
   2 intentos, el circuito se abrió tras 10 intentos fallidos y se cerró solo al volver el balanceador.
 - Con el proxy congelado y `PROXY_TIMEOUT_SEGUNDOS=2`, hace 4 intentos de 2 s y responde `504` en 14,3 s.
 - Con Windows inalcanzable: mientras el circuito del proxy está cerrado, cada `504` del proxy se
-  reintenta (4 intentos, `502` a los 23 s); con el circuito del proxy abierto el sd responde `503` en 3 a 4 ms con `Retry-After: 15`.
+  reintenta (4 intentos, `504` a los 22 s); con el circuito del proxy abierto el sd responde `503` en 3 a 4 ms con `Retry-After: 15`.
 
 ## Generación del PDF
 
