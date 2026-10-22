@@ -100,8 +100,8 @@ Errores en `application/problem+json` (RFC 9457):
 | Código | Cuándo |
 |---|---|
 | `400` | Id inválido o datos de la solicitud inválidos. `detail` lista todos los errores, por ejemplo `titularPrincipal es obligatorio. cupoAsignado debe ser mayor a 0.` |
-| `502` | El proxy respondió con error después de los reintentos (por ejemplo, falla SMB con Windows, o el proxy respondió `503` o `504` porque Windows no está disponible). `detail` incluye la respuesta del proxy |
-| `503` | No se pudo conectar con el proxy después de los reintentos, o el circuito está abierto |
+| `502` | El proxy respondió con error después de los reintentos (por ejemplo, falla SMB con Windows, o `504` porque Windows no respondió a tiempo). `detail` incluye la respuesta del proxy |
+| `503` | No se pudo conectar con el proxy después de los reintentos, el circuito del sd está abierto, o el circuito del proxy hacia Windows está abierto. En este último caso, sin reintentos y con el `Retry-After` del proxy |
 | `504` | El proxy no respondió dentro de `PROXY_TIMEOUT_SEGUNDOS` en ninguno de los intentos |
 
 ## Conexión al proxy
@@ -132,10 +132,11 @@ recibe la respuesta del proxy y sabe qué pasó; si fuera menor, cortaría el in
 reintentaría mientras el proxy sigue esperando a Windows.
 
 El proxy tiene su propio circuit breaker hacia Windows: cuando está abierto responde `503` al instante
-con `Retry-After`, así que los reintentos del sd no llegan a Windows. El manejador estándar respeta
-`Retry-After`: cada reintento espera 15 s en lugar de la espera exponencial, y el sd responde `502` a
-los 38 s (medido con Windows inalcanzable). No pasa del timeout total, pero retiene al cliente. Para
-fallar rápido habría que no reintentar los `503` del proxy o ignorar `Retry-After`.
+con `Retry-After`. **El sd no reintenta los `503` del proxy**: reintentar no sirve hasta que pase el
+`Retry-After`, y el manejador estándar lo respetaría esperando 15 s por reintento (se midió `502` a
+los 38 s antes de este cambio). En su lugar responde `503` "Carpeta compartida no disponible" al
+instante, con el mismo `Retry-After`. Los demás `5xx`, los timeouts y los errores de red se siguen
+reintentando.
 
 Medido:
 
@@ -143,6 +144,8 @@ Medido:
 - Con el balanceador detenido y los valores bajados por variables para la prueba, cada petición hizo
   2 intentos, el circuito se abrió tras 10 intentos fallidos y se cerró solo al volver el balanceador.
 - Con el proxy congelado y `PROXY_TIMEOUT_SEGUNDOS=2`, hace 4 intentos de 2 s y responde `504` en 14,3 s.
+- Con Windows inalcanzable: mientras el circuito del proxy está cerrado, cada `504` del proxy se
+  reintenta (4 intentos, `502` a los 23 s); con el circuito del proxy abierto el sd responde `503` en 3 a 4 ms con `Retry-After: 15`.
 
 ## Generación del PDF
 

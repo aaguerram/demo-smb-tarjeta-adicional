@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Net;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.Http.Resilience;
 using Polly.CircuitBreaker;
 using Polly.Timeout;
 using SdGenerarSolicitudTarjetaPdf;
@@ -77,7 +79,15 @@ builder.Services.AddHttpClient<ClienteProxyPdf>(c =>
         if (reintentos == 0)
             o.Retry.ShouldHandle = _ => ValueTask.FromResult(false); // Polly exige al menos 1: se apagan así
         else
+        {
             o.Retry.MaxRetryAttempts = reintentos;
+            // El proxy responde 503 solo con su circuito hacia Windows abierto: reintentar no sirve
+            // hasta que pase su Retry-After, y esperarlo retendría al cliente (15 s por reintento).
+            // Se falla rápido y el 503 llega al cliente con el mismo Retry-After.
+            o.Retry.ShouldHandle = args => ValueTask.FromResult(
+                args.Outcome.Result?.StatusCode != HttpStatusCode.ServiceUnavailable
+                && HttpClientResiliencePredicates.IsTransient(args.Outcome));
+        }
         o.Retry.Delay = esperaReintento;
         // Total: todos los intentos más las esperas exponenciales entre ellos (espera × (2^n − 1)),
         // con 1 s de margen. Con los valores por defecto: 4 × 10 s + 14 s + 1 s = 55 s.
@@ -95,7 +105,7 @@ app.UseStatusCodePages();
 
 // Recibe los datos de la solicitud, genera el PDF y lo envía al proxy para guardarlo en Windows.
 app.MapPost("/v1/solicitudes-tarjeta-adicional/{id}/pdf", async (string id, SolicitudTarjetaAdicional datos,
-    ClienteProxyPdf proxy, ILogger<Program> log, CancellationToken ct) =>
+    ClienteProxyPdf proxy, HttpContext http, ILogger<Program> log, CancellationToken ct) =>
 {
     if (!Regex.IsMatch(id, "^[A-Za-z0-9-]{1,64}$"))
         return Results.Problem(statusCode: 400, title: "Identificador inválido",
@@ -117,6 +127,14 @@ app.MapPost("/v1/solicitudes-tarjeta-adicional/{id}/pdf", async (string id, Soli
             pdf = guardado,
             milisegundos = new { generar = msGenerar, total = reloj.ElapsedMilliseconds },
         });
+    }
+    catch (ProxyPdfException ex) when (ex.Estado == StatusCodes.Status503ServiceUnavailable)
+    {
+        // Circuito del proxy abierto: Windows no está disponible. Sin reintentos y con su Retry-After.
+        log.LogWarning("Carpeta compartida no disponible para {Id}: {Mensaje}", id, ex.Message);
+        if (ex.ReintentarDespues is { } reintentar)
+            http.Response.Headers.RetryAfter = reintentar.ToString();
+        return Results.Problem(statusCode: 503, title: "Carpeta compartida no disponible", detail: ex.Message);
     }
     catch (ProxyPdfException ex)
     {

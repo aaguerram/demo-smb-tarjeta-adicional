@@ -22,7 +22,7 @@ public sealed class ClienteProxyPdf(HttpClient http)
         if (!respuesta.IsSuccessStatusCode)
         {
             var problema = await respuesta.Content.ReadAsStringAsync(ct);
-            throw new ProxyPdfException((int)respuesta.StatusCode, problema);
+            throw new ProxyPdfException((int)respuesta.StatusCode, problema, respuesta.Headers.RetryAfter);
         }
 
         var cuerpo = await respuesta.Content.ReadFromJsonAsync<RespuestaProxy>(ct)
@@ -38,8 +38,11 @@ public sealed class ClienteProxyPdf(HttpClient http)
 
 public sealed record PdfGuardado(string Ubicacion, int EstadoProxy, long Bytes, string Sha256, long MilisegundosProxy);
 
-public sealed class ProxyPdfException(int estado, string detalle)
+public sealed class ProxyPdfException(int estado, string detalle, RetryConditionHeaderValue? reintentarDespues = null)
     : Exception($"proxy-guardar-pdf respondió {estado}: {detalle}")
 {
     public int Estado { get; } = estado;
+
+    /// <summary>Retry-After del proxy (lo envía con el circuito hacia Windows abierto).</summary>
+    public RetryConditionHeaderValue? ReintentarDespues { get; } = reintentarDespues;
 }
