@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Polly.Core" Version="8.4.2" />
     <PackageReference Include="SMBLibrary" Version="1.5.8.1" />
   </ItemGroup>
 

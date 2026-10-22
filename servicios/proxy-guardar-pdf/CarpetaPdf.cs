@@ -176,7 +176,11 @@ public sealed class CarpetaPdf(PoolConexionesSmb pool)
 
 public sealed record OpcionesSmb(
     string Servidor, string Recurso, string Dominio, string Usuario, string Clave,
-    int MaxConexiones, TimeSpan Inactividad, TimeSpan VidaMaxima);
+    int MaxConexiones, TimeSpan Inactividad, TimeSpan VidaMaxima,
+    TimeSpan TimeoutConexion, TimeSpan TimeoutOperacion, OpcionesCircuito Circuito);
+
+/// <summary>Circuit breaker de las conexiones a Windows (variables SMB_CB_*).</summary>
+public sealed record OpcionesCircuito(double ProporcionFallas, int MinimoIntentos, TimeSpan Ventana, TimeSpan DuracionAbierto);
 
 public sealed record ResultadoGuardar(bool Creado, long Bytes, byte[] Sha256);
 

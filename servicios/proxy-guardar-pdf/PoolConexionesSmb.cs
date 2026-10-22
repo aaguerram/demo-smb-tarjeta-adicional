@@ -1,3 +1,7 @@
+using System.Net;
+using System.Net.Sockets;
+using Polly;
+using Polly.CircuitBreaker;
 using SMBLibrary;
 using SMBLibrary.Client;
 
@@ -13,6 +17,9 @@ namespace ProxyGuardarPdf;
 /// <item>Se cierran las ociosas por más de <c>Inactividad</c> y las que superan <c>VidaMaxima</c>,
 /// así que en reposo no queda ninguna conexión abierta contra el servidor.</item>
 /// <item>Una conexión que falla a nivel de transporte o de sesión SMB se descarta, no vuelve al pool.</item>
+/// <item>Abrir una conexión tiene un tiempo máximo (<c>TimeoutConexion</c>) y pasa por un
+/// <i>circuit breaker</i>: si Windows falla de forma sostenida, las peticiones que necesitan una
+/// conexión nueva se rechazan al instante en lugar de esperar al servidor caído.</item>
 /// </list>
 /// </summary>
 public sealed class PoolConexionesSmb : IDisposable
@@ -23,7 +30,10 @@ public sealed class PoolConexionesSmb : IDisposable
     private readonly Stack<ConexionSmb> _ociosas = new();
     private readonly Lock _candado = new();
     private readonly Timer _limpieza;
+    private readonly ResiliencePipeline _circuito;
+    private readonly CircuitBreakerStateProvider _estadoCircuito = new();
     private bool _cerrado;
+    private long _fallasAlAbrir, _timeoutsAlAbrir, _rechazosCircuito, _aperturasCircuito;
 
     private int _prestadas, _maxPrestadas;
     private long _creadas, _reutilizadas, _cerradasInactivas, _cerradasVidaMaxima, _descartadas, _reintentos;
@@ -41,6 +51,37 @@ public sealed class PoolConexionesSmb : IDisposable
         _cupos = new SemaphoreSlim(opciones.MaxConexiones, opciones.MaxConexiones);
         _concurrencia = new long[opciones.MaxConexiones + 1];
         _limpieza = new Timer(_ => CerrarVencidas(), null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+        var cb = opciones.Circuito;
+        _circuito = new ResiliencePipelineBuilder()
+            .AddCircuitBreaker(new CircuitBreakerStrategyOptions
+            {
+                FailureRatio = cb.ProporcionFallas,
+                MinimumThroughput = cb.MinimoIntentos,
+                SamplingDuration = cb.Ventana,
+                BreakDuration = cb.DuracionAbierto,
+                StateProvider = _estadoCircuito,
+                // Cuentan las fallas de red, SMB y timeout al abrir. No cuenta que el cliente
+                // cancele su petición (OperationCanceledException).
+                ShouldHandle = args => ValueTask.FromResult(args.Outcome.Exception is IOException),
+                OnOpened = args =>
+                {
+                    Interlocked.Increment(ref _aperturasCircuito);
+                    _log.LogError(args.Outcome.Exception,
+                        "Circuito SMB abierto por {Segundos} s: fallan las conexiones a {Servidor}", args.BreakDuration.TotalSeconds, opciones.Servidor);
+                    return default;
+                },
+                OnHalfOpened = _ =>
+                {
+                    _log.LogWarning("Circuito SMB semiabierto: se prueba una conexión a {Servidor}", opciones.Servidor);
+                    return default;
+                },
+                OnClosed = _ =>
+                {
+                    _log.LogInformation("Circuito SMB cerrado: {Servidor} responde de nuevo", opciones.Servidor);
+                    return default;
+                },
+            })
+            .Build();
     }
 
     public async Task<ConexionSmb> TomarAsync(CancellationToken ct)
@@ -82,7 +123,7 @@ public sealed class PoolConexionesSmb : IDisposable
                 Cerrar(ociosa, motivo);
             }
 
-            var nueva = ConexionSmb.Abrir(_opciones);
+            var nueva = await AbrirAsync(ct);
             Interlocked.Increment(ref _creadas);
             lock (_candado) _abiertas.Add(nueva);
             nueva.Usos++;
@@ -127,6 +168,34 @@ public sealed class PoolConexionesSmb : IDisposable
 
     public void ContarReintento() => Interlocked.Increment(ref _reintentos);
 
+    /// <summary>Abre una conexión nueva a través del circuit breaker, con tiempo máximo.</summary>
+    private async Task<ConexionSmb> AbrirAsync(CancellationToken ct)
+    {
+        try
+        {
+            return await _circuito.ExecuteAsync(static (estado, t) => new ValueTask<ConexionSmb>(ConexionSmb.AbrirAsync(estado, t)), _opciones, ct);
+        }
+        catch (BrokenCircuitException)
+        {
+            Interlocked.Increment(ref _rechazosCircuito);
+            throw;
+        }
+        catch (TimeoutConexionSmbException)
+        {
+            Interlocked.Increment(ref _fallasAlAbrir);
+            Interlocked.Increment(ref _timeoutsAlAbrir);
+            throw;
+        }
+        catch (IOException)
+        {
+            Interlocked.Increment(ref _fallasAlAbrir);
+            throw;
+        }
+    }
+
+    /// <summary>Estado del circuit breaker: Closed, Open, HalfOpen o Isolated.</summary>
+    public CircuitState EstadoCircuito => _estadoCircuito.CircuitState;
+
     public object Metricas()
     {
         int ociosas;
@@ -158,6 +227,14 @@ public sealed class PoolConexionesSmb : IDisposable
             esperasPorCupo = Interlocked.Read(ref _esperas),
             esperaTotalMs = Interlocked.Read(ref _esperaTotalMs),
             esperaMaximaMs = Interlocked.Read(ref _esperaMaximaMs),
+            circuito = new
+            {
+                estado = _estadoCircuito.CircuitState.ToString(),
+                aperturas = Interlocked.Read(ref _aperturasCircuito),
+                rechazos = Interlocked.Read(ref _rechazosCircuito),
+                fallasAlAbrir = Interlocked.Read(ref _fallasAlAbrir),
+                timeoutsAlAbrir = Interlocked.Read(ref _timeoutsAlAbrir),
+            },
             concurrenciaAlTomar = Enumerable.Range(1, _concurrencia.Length - 1)
                 .ToDictionary(i => i.ToString(), i => Interlocked.Read(ref _concurrencia[i])),
             conexiones,
@@ -236,11 +313,81 @@ public sealed class ConexionSmb : IDisposable
     /// <summary>True si una operación detectó que la conexión o la sesión SMB ya no sirven.</summary>
     public bool Rota { get; private set; }
 
-    public static ConexionSmb Abrir(OpcionesSmb opciones)
+    /// <summary>
+    /// Abre la conexión en como máximo <c>TimeoutConexion</c>: resolución DNS, conexión TCP al 445,
+    /// negociación, login y TreeConnect. Cada respuesta SMB (también las de las operaciones
+    /// posteriores) espera como máximo <c>TimeoutOperacion</c>.
+    /// </summary>
+    public static async Task<ConexionSmb> AbrirAsync(OpcionesSmb opciones, CancellationToken ct)
     {
-        var cliente = new SMB2Client(true);
-        if (!cliente.Connect(opciones.Servidor, SMBTransportType.DirectTCPTransport))
+        using var limite = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        limite.CancelAfter(opciones.TimeoutConexion);
+        SMB2Client? cliente = null;
+        Task<ConexionSmb>? apertura = null;
+        try
+        {
+            var direcciones = await Dns.GetHostAddressesAsync(opciones.Servidor, AddressFamily.InterNetwork, limite.Token);
+            if (direcciones.Length == 0) throw new IOException($"{opciones.Servidor} no tiene dirección IPv4");
+            var ip = direcciones[0];
+            // SMBLibrary conecta el socket de forma bloqueante y sin tiempo máximo: con el servidor
+            // caído, el hilo quedaría esperando lo que el sistema operativo tarde en desistir
+            // (unos 2 minutos en Linux). Por eso primero se prueba el 445 con un connect asíncrono
+            // cancelable, que no ocupa hilos.
+            using (var sonda = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp))
+                await sonda.ConnectAsync(new IPEndPoint(ip, 445), limite.Token);
+
+            cliente = new SMB2Client(true);
+            var c = cliente;
+            var timeoutMs = (int)opciones.TimeoutOperacion.TotalMilliseconds;
+            apertura = Task.Run(() => Conectar(c, ip, timeoutMs, opciones));
+            return await apertura.WaitAsync(limite.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            Descartar(cliente, apertura);
+            throw new TimeoutConexionSmbException(opciones.Servidor, opciones.TimeoutConexion);
+        }
+        catch (SocketException ex)
+        {
+            Descartar(cliente, apertura);
+            throw new IOException($"No se pudo conectar a {opciones.Servidor}:445: {ex.SocketErrorCode}", ex);
+        }
+        catch (OperationCanceledException)
+        {
+            Descartar(cliente, apertura);
+            throw;
+        }
+    }
+
+    // Si se cortó por tiempo, la apertura puede seguir en curso: se corta el socket y, si
+    // llegara a terminar bien, la conexión se cierra para no dejar sesiones huérfanas.
+    private static void Descartar(SMB2Client? cliente, Task<ConexionSmb>? apertura)
+    {
+        if (apertura is null) { cliente?.Disconnect(); return; }
+        cliente?.Disconnect();
+        _ = apertura.ContinueWith(t =>
+        {
+            if (t.IsCompletedSuccessfully) t.Result.Dispose();
+            else _ = t.Exception;
+        }, TaskScheduler.Default);
+    }
+
+    // SMBLibrary 1.5.8.1 espera cada respuesta SMB 5 s fijos: la sobrecarga de Connect que recibe
+    // el tiempo no es pública. Se ajusta el campo privado que leen todas las esperas (login,
+    // TreeConnect, lecturas y escrituras). Si una versión futura lo cambia, el proxy no arranca
+    // (ver VerificarCompatibilidad) en lugar de quedar sin timeout sin avisar.
+    private static readonly System.Reflection.FieldInfo? CampoTimeoutRespuesta = typeof(SMB2Client)
+        .GetField("m_responseTimeoutInMilliseconds", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    /// <summary>Null si esta versión de SMBLibrary permite fijar el timeout de respuesta; si no, el motivo.</summary>
+    public static string? VerificarCompatibilidad() => CampoTimeoutRespuesta?.FieldType == typeof(int) ? null
+        : "SMBLibrary no tiene el campo m_responseTimeoutInMilliseconds: no se puede aplicar SMB_TIMEOUT_OPERACION_SEGUNDOS. Revise la versión del paquete (probado con 1.5.8.1)";
+
+    private static ConexionSmb Conectar(SMB2Client cliente, IPAddress ip, int timeoutMs, OpcionesSmb opciones)
+    {
+        if (!cliente.Connect(ip, SMBTransportType.DirectTCPTransport))
             throw new IOException($"No se pudo conectar a {opciones.Servidor}:445");
+        CampoTimeoutRespuesta!.SetValue(cliente, timeoutMs);
         var conexion = new ConexionSmb { Cliente = cliente };
         try
         {
@@ -279,7 +426,10 @@ public sealed class ConexionSmb : IDisposable
     // SMBLibrary no define STATUS_NETWORK_SESSION_EXPIRED (MS-ERREF 0xC000035C).
     private const NTStatus StatusSesionExpirada = (NTStatus)0xC000035C;
 
+    // STATUS_IO_TIMEOUT: Windows no respondió dentro de SMB_TIMEOUT_OPERACION_SEGUNDOS. La sesión
+    // ya no es confiable (la respuesta podría llegar tarde), así que también se descarta.
     public static bool EsErrorDeConexion(NTStatus estado) => estado is
+        NTStatus.STATUS_IO_TIMEOUT or
         StatusSesionExpirada or
         NTStatus.STATUS_USER_SESSION_DELETED or
         NTStatus.STATUS_NETWORK_NAME_DELETED or
@@ -288,10 +438,12 @@ public sealed class ConexionSmb : IDisposable
 
     public void Dispose()
     {
-        // Cierre ordenado si todavía hay conexión: TreeDisconnect, Logoff y cierre TCP.
+        // Cierre ordenado si todavía hay conexión: TreeDisconnect, Logoff y cierre TCP. Si la
+        // conexión está rota (por ejemplo, un STATUS_IO_TIMEOUT) no se espera a Windows: cada paso
+        // del cierre ordenado esperaría SMB_TIMEOUT_OPERACION_SEGUNDOS una respuesta que no llega.
         try
         {
-            if (Cliente.IsConnected)
+            if (!Rota && Cliente.IsConnected)
             {
                 Recurso?.Disconnect();
                 Cliente.Logoff();
@@ -307,3 +459,7 @@ public sealed class ConexionSmb : IDisposable
         }
     }
 }
+
+/// <summary>Abrir la conexión SMB tardó más que <c>SMB_TIMEOUT_CONEXION_SEGUNDOS</c>.</summary>
+public sealed class TimeoutConexionSmbException(string servidor, TimeSpan limite)
+    : IOException($"{servidor} no respondió en {limite.TotalSeconds:0.#} s al abrir la conexión SMB");

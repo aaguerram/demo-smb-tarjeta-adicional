@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using Microsoft.Net.Http.Headers;
+using Polly.CircuitBreaker;
 using ProxyGuardarPdf;
 
 const long TamanoMaximo = 20 * 1024 * 1024;
@@ -8,17 +9,42 @@ const long TamanoMaximo = 20 * 1024 * 1024;
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.ConfigureKestrel(k => k.Limits.MaxRequestBodySize = TamanoMaximo);
 builder.Services.AddProblemDetails();
-// Las variables obligatorias se validan al arrancar. Si falta alguna, el proceso termina con
-// código 1 y un mensaje claro. Se usa Environment.Exit y no una excepción: en un contenedor el
-// proceso es PID 1 y el abort() de una excepción no controlada lo deja colgado en lugar de terminar.
+// Las variables se validan al arrancar. Si falta alguna o tiene un valor fuera de rango, el proceso
+// termina con código 1 y un mensaje claro. Se usa Environment.Exit y no una excepción: en un
+// contenedor el proceso es PID 1 y el abort() de una excepción no controlada lo deja colgado en
+// lugar de terminar.
 var configuracion = builder.Configuration;
 var errores = new[] { "SMB_SERVIDOR", "SMB_RECURSO", "SMB_USUARIO", "SMB_CLAVE" }
     .Where(nombre => string.IsNullOrEmpty(configuracion[nombre]))
     .Select(nombre => $"Falta la variable de entorno {nombre}")
     .ToList();
-var maxConexiones = configuracion.GetValue("SMB_MAX_CONEXIONES", 8);
-if (maxConexiones < 1)
-    errores.Add("SMB_MAX_CONEXIONES debe ser 1 o más");
+// Lee una variable numérica opcional: el valor por defecto si no está, error si no es un número o
+// está fuera de [min, max].
+T Numero<T>(string nombre, T defecto, T min, T max) where T : struct, IComparable<T>
+{
+    var texto = configuracion[nombre];
+    if (string.IsNullOrWhiteSpace(texto)) return defecto;
+    try
+    {
+        var valor = configuracion.GetValue<T>(nombre);
+        if (valor.CompareTo(min) >= 0 && valor.CompareTo(max) <= 0) return valor;
+    }
+    catch (InvalidOperationException) { }
+    errores.Add($"{nombre} debe ser un número entre {min} y {max} (se recibió \"{texto}\")");
+    return defecto;
+}
+var maxConexiones = Numero("SMB_MAX_CONEXIONES", 8, 1, 1000);
+var inactividad = Numero("SMB_INACTIVIDAD_SEGUNDOS", 30, 1, 3600);
+var vidaMaxima = Numero("SMB_VIDA_MAXIMA_MINUTOS", 10, 1, 1440);
+var timeoutConexion = Numero("SMB_TIMEOUT_CONEXION_SEGUNDOS", 3, 1, 120);
+var timeoutOperacion = Numero("SMB_TIMEOUT_OPERACION_SEGUNDOS", 5, 1, 300);
+var circuito = new OpcionesCircuito(
+    ProporcionFallas: Numero("SMB_CB_PROPORCION_FALLAS", 0.5, 0.01, 1.0),
+    MinimoIntentos: Numero("SMB_CB_MINIMO_INTENTOS", 5, 2, 10000),
+    Ventana: TimeSpan.FromSeconds(Numero("SMB_CB_VENTANA_SEGUNDOS", 30, 1, 3600)),
+    DuracionAbierto: TimeSpan.FromSeconds(Numero("SMB_CB_DURACION_ABIERTO_SEGUNDOS", 15, 1, 3600)));
+if (ConexionSmb.VerificarCompatibilidad() is { } incompatible)
+    errores.Add(incompatible);
 if (errores.Count > 0)
 {
     foreach (var error in errores) Console.Error.WriteLine(error);
@@ -33,8 +59,11 @@ builder.Services.AddSingleton(new OpcionesSmb(
     Usuario: Requerida("SMB_USUARIO"),
     Clave: Requerida("SMB_CLAVE"),
     MaxConexiones: maxConexiones,
-    Inactividad: TimeSpan.FromSeconds(builder.Configuration.GetValue("SMB_INACTIVIDAD_SEGUNDOS", 30)),
-    VidaMaxima: TimeSpan.FromMinutes(builder.Configuration.GetValue("SMB_VIDA_MAXIMA_MINUTOS", 10))));
+    Inactividad: TimeSpan.FromSeconds(inactividad),
+    VidaMaxima: TimeSpan.FromMinutes(vidaMaxima),
+    TimeoutConexion: TimeSpan.FromSeconds(timeoutConexion),
+    TimeoutOperacion: TimeSpan.FromSeconds(timeoutOperacion),
+    Circuito: circuito));
 // Registrados por tipo: el contenedor de DI llama Dispose al apagar y el pool cierra sus conexiones.
 builder.Services.AddSingleton<PoolConexionesSmb>();
 builder.Services.AddSingleton<CarpetaPdf>();
@@ -55,7 +84,7 @@ app.Use(async (http, siguiente) =>
 
 // Guarda o reemplaza el PDF {id}. PUT es idempotente: el cliente puede reintentar sin duplicar.
 // El cuerpo es el PDF en binario (application/pdf), sin Base64 ni multipart.
-app.MapPut("/v1/pdfs/{id}", async (string id, HttpRequest request, CarpetaPdf carpeta,
+app.MapPut("/v1/pdfs/{id}", async (string id, HttpContext http, HttpRequest request, CarpetaPdf carpeta,
     ILogger<Program> log, CancellationToken ct) =>
 {
     if (!IdValido(id))
@@ -107,6 +136,15 @@ app.MapPut("/v1/pdfs/{id}", async (string id, HttpRequest request, CarpetaPdf ca
         log.LogWarning("Cuerpo incompleto al guardar {Id}: {Mensaje}", id, ex.Message);
         return Problema(ex.StatusCode, "Cuerpo incompleto", ex.Message);
     }
+    catch (BrokenCircuitException ex)
+    {
+        return CircuitoAbierto(http, circuito, ex);
+    }
+    catch (Exception ex) when (EsTimeoutSmb(ex))
+    {
+        log.LogError("Timeout SMB al guardar {Id}: {Mensaje}", id, ex.Message);
+        return Problema(504, "La carpeta compartida no respondió a tiempo", ex.Message);
+    }
     catch (IOException ex)
     {
         log.LogError(ex, "Fallo SMB al guardar {Id}", id);
@@ -129,6 +167,14 @@ app.MapGet("/v1/pdfs/{id}", async (string id, HttpContext http, CarpetaPdf carpe
         }, ct);
         return existe ? Results.Empty : Problema(404, "PDF no encontrado", $"No existe {id}.pdf.");
     }
+    catch (BrokenCircuitException ex)
+    {
+        return CircuitoAbierto(http, circuito, ex);
+    }
+    catch (Exception ex) when (EsTimeoutSmb(ex))
+    {
+        return Problema(504, "La carpeta compartida no respondió a tiempo", ex.Message);
+    }
     catch (IOException ex)
     {
         return Problema(502, "No se pudo leer la carpeta compartida", ex.Message);
@@ -139,7 +185,33 @@ app.MapGet("/salud", () => Results.Ok(new { estado = "ok" }));
 app.MapGet("/metricas", (PoolConexionesSmb pool) =>
     Results.Ok(new { proceso = MetricasProceso.Capturar(), smb = pool.Metricas(), http = peticiones.Metricas() }));
 
+// Solo para pruebas de fuga de memoria y apagado por defecto: con DIAGNOSTICO_GC=true, fuerza un GC
+// completo y compactante y devuelve la memoria que sigue viva. Comparar el valor tras dos cargas
+// iguales dice si la memoria se estabiliza (sin fuga) o crece (fuga).
+if (app.Configuration.GetValue("DIAGNOSTICO_GC", false))
+    app.MapPost("/diagnostico/gc", () =>
+    {
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        return Results.Ok(new { vivoMB = GC.GetTotalMemory(false) / 1048576.0, proceso = MetricasProceso.Capturar() });
+    });
+
 app.Run();
+
+// Circuito abierto: Windows falló de forma sostenida y no se intenta conectar hasta que pase
+// SMB_CB_DURACION_ABIERTO_SEGUNDOS. Retry-After le indica al cliente cuándo volver a intentar.
+static IResult CircuitoAbierto(HttpContext http, OpcionesCircuito circuito, BrokenCircuitException ex)
+{
+    http.Response.Headers.RetryAfter = ((int)Math.Ceiling(circuito.DuracionAbierto.TotalSeconds)).ToString();
+    return Problema(503, "Carpeta compartida no disponible",
+        $"Circuito abierto tras fallas seguidas al conectar con Windows: {ex.Message}");
+}
+
+// Timeout al abrir la conexión (SMB_TIMEOUT_CONEXION_SEGUNDOS) o al esperar una respuesta SMB
+// (SMB_TIMEOUT_OPERACION_SEGUNDOS): es un 504, no un error de Windows.
+static bool EsTimeoutSmb(Exception ex) =>
+    ex is TimeoutConexionSmbException || ex is SmbException { Estado: SMBLibrary.NTStatus.STATUS_IO_TIMEOUT };
 
 static bool IdValido(string id) => Regex.IsMatch(id, "^[A-Za-z0-9-]{1,64}$");
 

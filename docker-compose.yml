@@ -57,6 +57,16 @@ services:
       SMB_MAX_CONEXIONES: ${SMB_MAX_CONEXIONES:-8}
       SMB_INACTIVIDAD_SEGUNDOS: ${SMB_INACTIVIDAD_SEGUNDOS:-30}
       SMB_VIDA_MAXIMA_MINUTOS: ${SMB_VIDA_MAXIMA_MINUTOS:-10}
+      # Tiempos máximos: abrir la conexión (DNS, TCP, login y TreeConnect) y cada respuesta SMB.
+      SMB_TIMEOUT_CONEXION_SEGUNDOS: ${SMB_TIMEOUT_CONEXION_SEGUNDOS:-3}
+      SMB_TIMEOUT_OPERACION_SEGUNDOS: ${SMB_TIMEOUT_OPERACION_SEGUNDOS:-5}
+      # Circuit breaker de las conexiones a Windows.
+      SMB_CB_PROPORCION_FALLAS: ${SMB_CB_PROPORCION_FALLAS:-0.5}
+      SMB_CB_MINIMO_INTENTOS: ${SMB_CB_MINIMO_INTENTOS:-5}
+      SMB_CB_VENTANA_SEGUNDOS: ${SMB_CB_VENTANA_SEGUNDOS:-30}
+      SMB_CB_DURACION_ABIERTO_SEGUNDOS: ${SMB_CB_DURACION_ABIERTO_SEGUNDOS:-15}
+      # Solo pruebas de fuga: habilita POST /diagnostico/gc. Apagado por defecto.
+      DIAGNOSTICO_GC: ${DIAGNOSTICO_GC:-false}
     # Rango de puertos para poder escalar réplicas: --scale proxy-guardar-pdf=4
     ports:
       - "127.0.0.1:8082-8085:8080"
@@ -90,6 +100,15 @@ services:
     environment:
       PROXY_GUARDAR_PDF_URL: http://balanceador-proxy:8080/
       PROXY_TIMEOUT_SEGUNDOS: ${PROXY_TIMEOUT_SEGUNDOS:-10}
+      # Reintentos hacia el proxy (0 los desactiva) y espera base exponencial.
+      PROXY_REINTENTOS: ${PROXY_REINTENTOS:-3}
+      PROXY_REINTENTO_ESPERA_MS: ${PROXY_REINTENTO_ESPERA_MS:-2000}
+      # Circuit breaker hacia el proxy. La ventana por defecto es max(30, 2 × PROXY_TIMEOUT_SEGUNDOS).
+      PROXY_CB_PROPORCION_FALLAS: ${PROXY_CB_PROPORCION_FALLAS:-0.1}
+      PROXY_CB_MINIMO_INTENTOS: ${PROXY_CB_MINIMO_INTENTOS:-100}
+      PROXY_CB_VENTANA_SEGUNDOS: ${PROXY_CB_VENTANA_SEGUNDOS:-}
+      PROXY_CB_DURACION_ABIERTO_SEGUNDOS: ${PROXY_CB_DURACION_ABIERTO_SEGUNDOS:-5}
+      DIAGNOSTICO_GC: ${DIAGNOSTICO_GC:-false}
     ports:
       - "127.0.0.1:8081:8080"
     depends_on:
