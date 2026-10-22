@@ -22,7 +22,7 @@ cliente ─POST JSON─▶ sd-generar-solicitud-tarjeta-pdf ─PUT application/p
 .
 ├── docker-compose.yml
 ├── servicios/
-│   ├── sd-generar-solicitud-tarjeta-pdf/   # genera el PDF y llama al proxy
+│   ├── sd-generar-solicitud-tarjeta-pdf/   # genera el PDF y llama al proxy (README propio)
 │   └── proxy-guardar-pdf/                  # API de PDF + PoolConexionesSmb + CarpetaPdf (README propio)
 ├── balanceador/nginx.conf                  # round-robin entre réplicas del proxy
 ├── oem/                                    # scripts que configuran Windows al terminar la instalación
@@ -163,7 +163,7 @@ Errores en `application/problem+json` (RFC 9457). `{id}`: de 1 a 64 letras, núm
 
 | Operación | Petición | Respuestas |
 |---|---|---|
-| Generar y guardar | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf` con `titularPrincipal`, `ultimosDigitosTarjetaPrincipal`, `nombreAdicional`, `identificacionAdicional`, `parentesco` y `cupoAsignado` | `201` con ubicación, tamaño y SHA-256 del PDF, `400`, `502` si el proxy lo rechazó, `503` si el proxy no responde |
+| Generar y guardar | `POST /v1/solicitudes-tarjeta-adicional/{id}/pdf` con `titularPrincipal`, `ultimosDigitosTarjetaPrincipal`, `nombreAdicional`, `identificacionAdicional`, `parentesco` y `cupoAsignado` | `201` con ubicación, tamaño y SHA-256 del PDF, `400` con todos los errores de validación, `502` si el proxy lo rechazó, `503` si el proxy no responde (sin conexión, timeout o circuito abierto) |
 
 ## Pool de conexiones SMB
 
@@ -179,8 +179,10 @@ Errores en `application/problem+json` (RFC 9457). `{id}`: de 1 a 64 letras, núm
 
 ## Configuración
 
-La descripción completa del proxy y todas sus variables de entorno están en
-[servicios/proxy-guardar-pdf/README.md](servicios/proxy-guardar-pdf/README.md).
+Cada servicio tiene su README con la descripción, la API y todas sus variables de entorno:
+
+- [servicios/proxy-guardar-pdf/README.md](servicios/proxy-guardar-pdf/README.md)
+- [servicios/sd-generar-solicitud-tarjeta-pdf/README.md](servicios/sd-generar-solicitud-tarjeta-pdf/README.md)
 
 | Variable | Por defecto | Servicio |
 |---|---|---|

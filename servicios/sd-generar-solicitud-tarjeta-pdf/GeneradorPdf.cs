@@ -15,11 +15,11 @@ public static class GeneradorPdf
         {
             ("Número de solicitud", s.Id),
             ("Fecha", DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm 'UTC'", CultureInfo.InvariantCulture)),
-            ("Titular principal", s.TitularPrincipal),
+            ("Titular principal", s.TitularPrincipal!),
             ("Tarjeta principal", $"**** **** **** {s.UltimosDigitosTarjetaPrincipal}"),
-            ("Nombre del adicional", s.NombreAdicional),
-            ("Identificación del adicional", s.IdentificacionAdicional),
-            ("Parentesco", s.Parentesco),
+            ("Nombre del adicional", s.NombreAdicional!),
+            ("Identificación del adicional", s.IdentificacionAdicional!),
+            ("Parentesco", s.Parentesco!),
             ("Cupo asignado", s.CupoAsignado.ToString("N2", CultureInfo.InvariantCulture) + " USD"),
         };
 
